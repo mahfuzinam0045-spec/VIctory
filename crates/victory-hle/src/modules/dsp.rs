@@ -180,7 +180,9 @@ impl Reverb {
                 *o = ap_out * out_gain;
             }
         } else if channels == 2 {
-            for (i_chunk, o_chunk) in input.chunks_exact(2).zip(output.chunks_exact_mut(2)) {
+            let (in_pairs, _) = input.as_chunks::<2>();
+            let (out_pairs, _) = output.as_chunks_mut::<2>();
+            for (i_chunk, o_chunk) in in_pairs.iter().zip(out_pairs.iter_mut()) {
                 let xl = i_chunk[0] * in_gain;
                 let xr = i_chunk[1] * in_gain;
 
@@ -371,8 +373,9 @@ pub extern "system" fn XDspSubmitCommand(
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
         if let (Some(reverb), false) = (&mut stream.reverb, command.input.is_null()) {
-            // SAFETY: title passes input and output buffers holding `samples` floats.
+            // SAFETY: title passes an input buffer holding `samples` floats.
             let input = unsafe { std::slice::from_raw_parts(command.input, samples) };
+            // SAFETY: title passes an output buffer holding `samples` floats.
             let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
             reverb.process(input, output, command.gains, stream.channels);
         } else {
