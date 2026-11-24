@@ -11,9 +11,10 @@
 //!
 //! The transforms themselves are not computed: the hardware takes impulse
 //! responses already in its own partitioned frequency-domain layout, which
-//! is not known. Outputs are silence, so reverb returns are dry.
-// shortcut: no convolution or block transform; outputs are zeros. Needs the
-// coprocessor's impulse response and spectrum layouts to do better.
+//! is not known. Outputs are silence by default, or an algorithmic reverb
+//! fallback when `VICTORY_AUDIO_REVERB=1` is set.
+// shortcut: hardware convolution IR layout is not known; outputs are zeros
+// by default, with an algorithmic Schroeder reverb fallback when enabled.
 #![allow(non_snake_case)]
 #![allow(clippy::not_unsafe_ptr_arg_deref)]
 
@@ -57,10 +58,162 @@ pub struct Status {
     result: HRESULT,
 }
 
+/// Comb filter for the algorithmic reverb fallback.
+#[derive(Debug)]
+struct Comb {
+    buffer: Vec<f32>,
+    index: usize,
+    feedback: f32,
+    damp: f32,
+    store: f32,
+}
+
+impl Comb {
+    fn new(delay: usize, feedback: f32, damp: f32) -> Self {
+        Self {
+            buffer: vec![0.0; delay],
+            index: 0,
+            feedback,
+            damp,
+            store: 0.0,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        let output = self.buffer[self.index];
+        self.store = output * (1.0 - self.damp) + self.store * self.damp;
+        self.buffer[self.index] = input + self.store * self.feedback;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+        output
+    }
+}
+
+/// Allpass filter for diffuse room reflections.
+#[derive(Debug)]
+struct Allpass {
+    buffer: Vec<f32>,
+    index: usize,
+    feedback: f32,
+}
+
+impl Allpass {
+    fn new(delay: usize, feedback: f32) -> Self {
+        Self {
+            buffer: vec![0.0; delay],
+            index: 0,
+            feedback,
+        }
+    }
+
+    #[inline]
+    fn process(&mut self, input: f32) -> f32 {
+        let buf_out = self.buffer[self.index];
+        let output = -input + buf_out;
+        self.buffer[self.index] = input + buf_out * self.feedback;
+        self.index += 1;
+        if self.index >= self.buffer.len() {
+            self.index = 0;
+        }
+        output
+    }
+}
+
+/// Schroeder-style algorithmic reverb generator used as fallback when hardware
+/// frequency-domain convolution impulse responses cannot be evaluated.
+#[derive(Debug)]
+pub struct Reverb {
+    combs_l: [Comb; 4],
+    combs_r: [Comb; 4],
+    allpasses_l: [Allpass; 2],
+    allpasses_r: [Allpass; 2],
+}
+
+impl Default for Reverb {
+    fn default() -> Self {
+        Self::new()
+    }
+}
+
+impl Reverb {
+    pub fn new() -> Self {
+        Self {
+            combs_l: [
+                Comb::new(1557, 0.84, 0.2),
+                Comb::new(1617, 0.84, 0.2),
+                Comb::new(1491, 0.84, 0.2),
+                Comb::new(1422, 0.84, 0.2),
+            ],
+            combs_r: [
+                Comb::new(1557 + 23, 0.84, 0.2),
+                Comb::new(1617 + 23, 0.84, 0.2),
+                Comb::new(1491 + 23, 0.84, 0.2),
+                Comb::new(1422 + 23, 0.84, 0.2),
+            ],
+            allpasses_l: [
+                Allpass::new(225, 0.5),
+                Allpass::new(556, 0.5),
+            ],
+            allpasses_r: [
+                Allpass::new(225 + 23, 0.5),
+                Allpass::new(556 + 23, 0.5),
+            ],
+        }
+    }
+
+    pub fn process(&mut self, input: &[f32], output: &mut [f32], gains: [f32; 2], channels: u32) {
+        let (in_gain, out_gain) = (gains[0], gains[1]);
+        if channels == 1 {
+            for (i, o) in input.iter().zip(output.iter_mut()) {
+                let x = *i * in_gain;
+                let mut comb_out = 0.0;
+                for c in &mut self.combs_l {
+                    comb_out += c.process(x);
+                }
+                let mut ap_out = comb_out * 0.25;
+                for a in &mut self.allpasses_l {
+                    ap_out = a.process(ap_out);
+                }
+                *o = ap_out * out_gain;
+            }
+        } else if channels == 2 {
+            for (i_chunk, o_chunk) in input.chunks_exact(2).zip(output.chunks_exact_mut(2)) {
+                let xl = i_chunk[0] * in_gain;
+                let xr = i_chunk[1] * in_gain;
+
+                let mut out_l = 0.0;
+                for c in &mut self.combs_l {
+                    out_l += c.process(xl);
+                }
+                let mut ap_l = out_l * 0.25;
+                for a in &mut self.allpasses_l {
+                    ap_l = a.process(ap_l);
+                }
+
+                let mut out_r = 0.0;
+                for c in &mut self.combs_r {
+                    out_r += c.process(xr);
+                }
+                let mut ap_r = out_r * 0.25;
+                for a in &mut self.allpasses_r {
+                    ap_r = a.process(ap_r);
+                }
+
+                o_chunk[0] = ap_l * out_gain;
+                o_chunk[1] = ap_r * out_gain;
+            }
+        }
+    }
+}
+
 pub struct Stream {
     dsp: *mut Dsp,
     frames: u32,
     channels: u32,
+    reverb: Option<Reverb>,
     status: Box<Status>,
 }
 
@@ -164,10 +317,19 @@ pub extern "system" fn XDspActivate(
         }
         *active += 1;
     }
+    let reverb_enabled = std::env::var("VICTORY_AUDIO_REVERB")
+        .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+        .unwrap_or(false);
+    let reverb = if kind == CONVOLUTION && reverb_enabled {
+        Some(Reverb::new())
+    } else {
+        None
+    };
     let new = Box::new(Stream {
         dsp,
         frames: desc.frames,
         channels: desc.channels,
+        reverb,
         status: Box::new(Status {
             submitted: 0,
             completed: 0,
@@ -208,8 +370,16 @@ pub extern "system" fn XDspSubmitCommand(
     let (stream, command) = unsafe { (&mut *stream, &*command) };
     if !command.output.is_null() {
         let samples = (stream.frames * stream.channels) as usize;
-        // SAFETY: the title's output buffer holds one block of the stream.
-        unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        if let (Some(reverb), false) = (&mut stream.reverb, command.input.is_null()) {
+            // SAFETY: title passes input and output buffers holding `samples` floats.
+            let input = unsafe { std::slice::from_raw_parts(command.input, samples) };
+            let output = unsafe { std::slice::from_raw_parts_mut(command.output, samples) };
+            reverb.process(input, output, command.gains, stream.channels);
+        } else {
+            // Default: silence output.
+            // SAFETY: the title's output buffer holds one block of the stream.
+            unsafe { std::ptr::write_bytes(command.output, 0, samples) };
+        }
     }
     let status = &mut *stream.status;
     let next = status.submitted.wrapping_add(1);
@@ -310,5 +480,16 @@ mod tests {
         );
         assert_eq!(XDspDeactivate(stream), S_OK);
         assert_eq!(XDspDisconnect(dsp), S_OK);
+    }
+
+    #[test]
+    fn reverb_fallback_when_enabled() {
+        let mut reverb = Reverb::new();
+        let mut input = vec![0.0f32; 1024];
+        input[0] = 1.0;
+        input[1] = 1.0;
+        let mut output = vec![0.0f32; 1024];
+        reverb.process(&input, &mut output, [1.0, 1.0], 2);
+        assert!(output.iter().any(|&s| s != 0.0));
     }
 }
